@@ -14,9 +14,10 @@
   components to a symbol with just a name."
   [sym]
   (when sym
-    (if (= (namespace sym) (name sym))
-      (symbol (name sym))
-      sym)))
+    (cond-> (if (= (namespace sym) (name sym))
+              (symbol (name sym))
+              sym)
+      (symbol? sym) (with-meta (meta sym)))))
 
 
 (defn project-name
@@ -98,15 +99,20 @@
   the project's profiles to ensure the project has the proper dependency closure
   for compilation ordering."
   [project]
-  (->>
-    project
-    (:profiles)
-    (vals)
-    (cons project)
-    (mapcat :dependencies)
-    (map (comp condense-name first))
-    (set)))
-
+  (into #{}
+        (map (comp condense-name first))
+        (concat
+          (:dependencies project)
+          (mapcat (fn [[pname profile]]
+                    (map (fn [d]
+                           {:pre [(vector? d)]}
+                           (update d 0
+                                   (fn [sym]
+                                     (cond-> sym
+                                       (symbol? sym)
+                                       (vary-meta assoc ::profile pname)))))
+                         (:dependencies profile)))
+                  (:profiles project)))))
 
 (defn dependency-map
   "Converts a map of project names to definitions into a map of project names
@@ -165,21 +171,120 @@
           (recur (conj result node)
                  (into (pop queue) (set/difference consumers result))))))))
 
+(defn- unqualify-profile [dep]
+  (if (and (vector? dep)
+           (-> dep (nth 0) #{::profile}))
+    (nth dep 1)
+    dep))
+
+(defn- qualify-profile [dep]
+  (if-some [profile (-> dep meta ::profile)]
+    [::profile dep]
+    dep))
 
 (defn topological-sort
   "Returns a sequence of the keys in the map `m`, ordered such that no key `k1`
   appearing before `k2` satisfies `(contains? (upstream-keys m k1) k2)`. In
   other words, earlier keys do not transitively depend on any later keys."
   ([m]
-   (when (seq m)
-     ; Note that 'roots' here are keys which no other keys depend on, hence
-     ; should appear *later* in the sequence.
-     (let [roots (apply set/difference (set (keys m)) (map set (vals m)))]
-       (when (empty? roots)
-         (throw (ex-info "Cannot sort the keys in the given map, cycle detected!"
-                         {:input m})))
-       (concat (topological-sort (apply dissoc m roots))
-               (sort roots)))))
+   (let [;used synchronously, rethink approach if parallelizing this function
+         warned-cycle (atom nil)
+         topological-sort
+         (fn topological-sort [m]
+           (when (seq m)
+             ; allow cycles between regular dependencies and profile
+             ; dependencies. for example, `a` is a root dependency
+             ; in the following examples.
+             ; 
+             ; + a (test profile)
+             ;   + b (test profile)
+             ;     + a (no profile)
+             ; + a (test profile)
+             ;   + a (no profile)
+             (if-some [roots
+                       (not-empty
+                         (let [find-roots (fn [f]
+                                            (into #{}
+                                                  (map unqualify-profile)
+                                                  (apply set/difference
+                                                         (set (keys m))
+                                                         (map #(into #{}
+                                                                     (map f)
+                                                                     %)
+                                                              (vals m)))))]
+                           ;first attempt to find roots without
+                           ; special treatment to profile dependencies
+                           (or (not-empty (find-roots identity))
+                               (let [roots (find-roots qualify-profile)]
+                                 ;we resolved the cycle by treating profiles specially,
+                                 ; so emit a warning.
+                                 (when (and (seq roots)
+                                            (not @warned-cycle))
+                                   (some (fn [root]
+                                           (when-let [cyclic-profile-dep
+                                                      (some
+                                                        ; find the dep that cycles
+                                                        (fn [d]
+                                                          (when (contains? (m d) root)
+                                                            d))
+                                                        (m root))]
+                                             (let [dep-profile (-> cyclic-profile-dep
+                                                                   meta ::profile)
+                                                   reverse-dep-profile (-> ((m cyclic-profile-dep) root)
+                                                                           meta
+                                                                           ::profile)]
+                                               (binding [*out* *err*]
+                                                 (println
+                                                   (let [msg
+                                                         (str "WARNING: "
+                                                              root
+                                                              " and "
+                                                              cyclic-profile-dep
+                                                              " form a dependency cycle! "
+                                                              "(Only reporting first cycle, may be more)\n"
+                                                              "- "
+                                                              (if dep-profile
+                                                                (str root
+                                                                     " depends on "
+                                                                     cyclic-profile-dep
+                                                                     " in its "
+                                                                     dep-profile
+                                                                     " profile")
+                                                                (str cyclic-profile-dep
+                                                                     " is a normal dependency of "
+                                                                     root))
+                                                              "\n"
+                                                              "- "
+                                                              (if reverse-dep-profile
+                                                                (str cyclic-profile-dep
+                                                                     " depends on "
+                                                                     root
+                                                                     " in its "
+                                                                     reverse-dep-profile
+                                                                     " profile")
+                                                                (str cyclic-profile-dep
+                                                                     " is a normal dependency of "
+                                                                     root))
+                                                              "\n"
+                                                              (str "Resolving the cycle by "
+                                                                   (if (every? roots [root cyclic-profile-dep])
+                                                                     (str "building " root " and " cyclic-profile-dep
+                                                                          " in an arbitrary order relative to one-another.")
+                                                                     (str "building " cyclic-profile-dep " before " root "."))))]
+                                                     (->> msg
+                                                          str/split-lines
+                                                          (map #(str "[lein-monolith] " %))
+                                                          (str/join "\n"))))))
+                                             (reset! warned-cycle true)))
+                                         roots))
+                                   roots))))]
+               ; Note that 'roots' here are keys which no other keys depend on, hence
+               ; should appear *later* in the sequence.
+               (concat (topological-sort (apply dissoc m roots))
+                       (sort roots))
+               (throw (ex-info "Cannot sort the keys in the given map, cycle detected!"
+                               {:input m})))))]
+     (topological-sort m)))
   ([m ks]
    (filter (set ks) (topological-sort m))))
 
