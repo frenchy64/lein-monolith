@@ -2,7 +2,7 @@
 ; everything before -classifier-cycle are the same as the upstream library.
 ; y in classifier-cycle-y should be incremented every time we release a new
 ; version based on the same upstream dep.
-(defproject threatgrid/lein-monolith "1.4.1-SNAPSHOT-classifier-cycle-0"
+(defproject threatgrid/lein-monolith "1.4.1-SNAPSHOT-classifier-cycle-1-SNAPSHOT"
   :description "Leiningen plugin for managing subrojects within a monorepo."
   :url "https://github.com/amperity/lein-monolith"
   :license {:name "Apache License 2.0"
