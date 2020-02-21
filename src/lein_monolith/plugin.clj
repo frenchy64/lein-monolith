@@ -16,30 +16,66 @@
   [subprojects]
   (mapv #(vector (key %) (:version (val %))) subprojects))
 
+(defn- relative->absolute-path [project path]
+  (str (:root project) "/" path))
 
 (defn- add-profile-paths
   "Update a profile paths entry by adding the absolute paths from the given
   project. Returns the updated profile."
   [profile project k]
-  (update profile k into
-          (map (partial str (:root project) "/")
+  (update profile k (fnil into [])
+          (map #(relative->absolute-path project %)
                (get project k))))
+
+(defn- add-profile-paths-from-profiles
+  "For each :profile `from-profiles` declared in `project`,
+  merge in paths `ks` into `profile`."
+  [profile project from-profiles ks]
+  (reduce (fn [profile [from-profile k]]
+            (update profile k (fnil into [])
+                    (map #(relative->absolute-path project %)
+                         (get-in project [:profiles from-profile k]))))
+          profile
+          (for [fp from-profiles
+                k ks]
+            [fp k])))
+
+(defn- add-profile-profile-dependencies
+  "Add the :dependencies of project's k profile to the profile."
+  [profile project k]
+  (update profile :dependencies (fnil into [])
+          (get-in project [:profiles k :dependencies])))
 
 
 (defn merged-profile
   "Constructs a profile map containing merged (re)source and test paths."
   [subprojects]
-  (reduce-kv
-    (fn [profile _ project]
-      (-> profile
-          (add-profile-paths project :resource-paths)
-          (add-profile-paths project :source-paths)
-          (add-profile-paths project :test-paths)))
-    {:dependencies (subproject-dependencies subprojects)
-     :resource-paths []
-     :source-paths []
-     :test-paths []}
-    subprojects))
+  (let [from-profiles [:dev :test]
+        paths-keys [:resource-paths
+                    :source-paths
+                    :test-paths]]
+    (reduce-kv
+      (fn [profile _ project]
+        (let [; merge top-level paths keys from project
+              profile (reduce #(add-profile-paths %1 project %2)
+                              profile
+                              paths-keys)
+              ; merge dependencies from named :profiles
+              profile (reduce #(add-profile-profile-dependencies %1 project %2)
+                              profile
+                              from-profiles)
+              ; merge extra paths from named :profiles
+              profile (add-profile-paths-from-profiles
+                        profile
+                        project
+                        from-profiles
+                        paths-keys)]
+          profile))
+      {:dependencies (subproject-dependencies subprojects)
+       :resource-paths []
+       :source-paths []
+       :test-paths []}
+      subprojects)))
 
 
 (defn inherited-profile
